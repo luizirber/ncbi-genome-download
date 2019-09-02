@@ -30,6 +30,7 @@ tests_require = [
     'pytest-cov',
     'requests-mock',
     'pytest-mock',
+    'pytest-asyncio',
 ]
 
 

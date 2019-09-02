@@ -3,6 +3,7 @@ from __future__ import print_function
 
 from appdirs import user_cache_dir
 import argparse
+import asyncio
 import codecs
 from datetime import datetime, timedelta
 import errno
@@ -138,7 +139,7 @@ def download(**kwargs):
 
     """
     config = NgdConfig.from_kwargs(**kwargs)
-    return config_download(config)
+    return asyncio.run(config_download(config))
 
 
 def args_download(args):
@@ -156,10 +157,10 @@ def args_download(args):
 
     """
     config = NgdConfig.from_namespace(args)
-    return config_download(config)
+    return asyncio.run(config_download(config))
 
 
-def config_download(config):
+async def config_download(config):
     """Run the actual download from NCBI with parameters in a config object.
 
     Parameters
