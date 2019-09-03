@@ -11,18 +11,9 @@ long_description = read('README.md')
 
 install_requires = [
     'appdirs',
-    'requests >= 2.4.3',
+    'asks',
+    'trio'
 ]
-
-# Can't use environment markers on old setuptools, so fix the requirements
-# dynamically here. For wheels, again override the requirements in setup.cfg
-# to not cause conflicts.
-if sys.version_info[:3] < (2, 7, 9):
-    install_requires.extend(['pyOpenSSL', 'ndg-httpsclient'])
-
-# Enum is only available since 3.4
-if sys.version_info[:3] < (3, 4, 0):
-    install_requires.extend(['enum34',])
 
 tests_require = [
     'pytest',
@@ -30,7 +21,7 @@ tests_require = [
     'pytest-cov',
     'requests-mock',
     'pytest-mock',
-    'pytest-asyncio',
+    'pytest-trio',
 ]
 
 

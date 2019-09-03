@@ -3,7 +3,6 @@ from __future__ import print_function
 
 from appdirs import user_cache_dir
 import argparse
-import asyncio
 import codecs
 from datetime import datetime, timedelta
 import errno
@@ -14,7 +13,9 @@ import sys
 from io import StringIO
 from multiprocessing import Pool
 
-import requests
+import asks
+import trio
+asks.init('trio')
 
 from .config import (
     NgdConfig,
@@ -22,12 +23,6 @@ from .config import (
 from .jobs import DownloadJob
 from . import metadata
 from .summary import SummaryReader
-
-# Python < 2.7.9 hack: fix ssl support
-if sys.version_info < (2, 7, 9):  # pragma: no cover
-    from requests.packages.urllib3.contrib import pyopenssl
-    pyopenssl.inject_into_urllib3()
-
 
 # Get the user's cache dir in a system-independent manner
 CACHE_DIR = user_cache_dir(appname="ncbi-genome-download", appauthor="kblin")
@@ -139,7 +134,7 @@ def download(**kwargs):
 
     """
     config = NgdConfig.from_kwargs(**kwargs)
-    return asyncio.run(config_download(config))
+    return trio.run(config_download, config)
 
 
 def args_download(args):
@@ -157,7 +152,7 @@ def args_download(args):
 
     """
     config = NgdConfig.from_namespace(args)
-    return asyncio.run(config_download(config))
+    return trio.run(config_download, config)
 
 
 async def config_download(config):
@@ -175,52 +170,39 @@ async def config_download(config):
 
     """
     logger = logging.getLogger("ncbi-genome-download")
-    try:
-        download_candidates = select_candidates(config)
+    download_candidates = await select_candidates(config)
 
-        if len(download_candidates) < 1:
-            logger.error("No downloads matched your filter. Please check your options.")
-            return 1
+    if len(download_candidates) < 1:
+        logging.error("No downloads matched your filter. Please check your options.")
+        return 1
 
-        if config.dry_run:
-            print("Considering the following {} assemblies for download:".format(len(download_candidates)))
-            for entry, _ in download_candidates:
-                print(entry['assembly_accession'], entry['organism_name'], sep="\t")
+    if config.dry_run:
+        print("Considering the following {} assemblies for download:".format(len(download_candidates)))
+        for entry, _ in download_candidates:
+            print(entry['assembly_accession'], entry['organism_name'], sep="\t")
 
-            return 0
+        return 0
 
-        download_jobs = []
+    async with trio.open_nursery() as nursery:
         for entry, group in download_candidates:
-            download_jobs.extend(create_downloadjob(entry, group, config))
+            async for dl_job in create_downloadjob(entry, group, config):
+                nursery.start_soon(worker, dl_job)
+    # TODO: move exception logic here. save failed dl_job into a list,
+    #       retry it
+    #except requests.exceptions.ConnectionError as err:
+    #    logger.error('Download from NCBI failed: %r', err)
+    # Exit code 75 meas TEMPFAIL in C/C++, so let's stick with that for now.
+    #    return 75
 
-        if config.parallel == 1:
-            for dl_job in download_jobs:
-                worker(dl_job)
-        else:  # pragma: no cover
-            # Testing multiprocessing code is annoying
-            pool = Pool(processes=config.parallel)
-            jobs = pool.map_async(worker, download_jobs)
-            try:
-                # 0xFFFF is just "a really long time"
-                jobs.get(0xFFFF)
-            except KeyboardInterrupt:
-                # TODO: Actually test this once I figure out how to do this in py.test
-                logger.error("Interrupted by user")
-                return 1
+    if config.metadata_table:
+        with codecs.open(config.metadata_table, mode='w', encoding='utf-8') as handle:
+            table = metadata.get()
+            table.write(handle)
 
-        if config.metadata_table:
-            with codecs.open(config.metadata_table, mode='w', encoding='utf-8') as handle:
-                table = metadata.get()
-                table.write(handle)
-
-    except requests.exceptions.ConnectionError as err:
-        logger.error('Download from NCBI failed: %r', err)
-        # Exit code 75 meas TEMPFAIL in C/C++, so let's stick with that for now.
-        return 75
     return 0
 
 
-def select_candidates(config):
+async def select_candidates(config):
     """Select candidates to download.
 
     Parameters
@@ -236,7 +218,7 @@ def select_candidates(config):
     download_candidates = []
 
     for group in config.group:
-        summary_file = get_summary(config.section, group, config.uri, config.use_cache)
+        summary_file = await get_summary(config.section, group, config.uri, config.use_cache)
         entries = parse_summary(summary_file)
 
         for entry in filter_entries(entries, config):
@@ -292,14 +274,16 @@ def filter_entries(entries, config):
     return new_entries
 
 
-def worker(job):
+async def worker(job):
     """Run a single download job."""
     logger = logging.getLogger("ncbi-genome-download")
     ret = False
     try:
         if job.full_url is not None:
-            req = requests.get(job.full_url, stream=True)
-            ret = save_and_check(req, job.local_file, job.expected_checksum)
+            req = await asks.get(job.full_url, stream=True)
+
+            ret = await save_and_check(req, job.local_file, job.expected_checksum)
+
             if not ret:
                 return ret
         ret = create_symlink(job.local_file, job.symlink_path)
@@ -310,7 +294,7 @@ def worker(job):
     return ret
 
 
-def get_summary(section, domain, uri, use_cache):
+async def get_summary(section, domain, uri, use_cache):
     """Get the assembly_summary.txt file from NCBI and return a StringIO object for it."""
     logger = logging.getLogger("ncbi-genome-download")
     logger.debug('Checking for a cached summary file')
@@ -326,7 +310,7 @@ def get_summary(section, domain, uri, use_cache):
     logger.debug('Downloading summary for %r/%r uri: %r', section, domain, uri)
     url = '{uri}/{section}/{domain}/assembly_summary.txt'.format(
         section=section, domain=domain, uri=uri)
-    req = requests.get(url)
+    req = await asks.get(url)
 
     if use_cache:
         try:
@@ -347,7 +331,7 @@ def parse_summary(summary_file):
     return SummaryReader(summary_file)
 
 
-def create_downloadjob(entry, domain, config):
+async def create_downloadjob(entry, domain, config):
     """Create download jobs for all file formats from a summary file entry."""
     logger = logging.getLogger("ncbi-genome-download")
     logger.info('Checking record %r', entry['assembly_accession'])
@@ -357,28 +341,23 @@ def create_downloadjob(entry, domain, config):
     if config.human_readable:
         symlink_path = create_readable_dir(entry, config.section, domain, config.output)
 
-    checksums = grab_checksums_file(entry)
+    checksums = await grab_checksums_file(entry)
 
     if not config.flat_output:
         # TODO: Only write this when the checksums file changed
-        with open(os.path.join(full_output_dir, 'MD5SUMS'), 'w') as handle:
-            handle.write(checksums)
+        async with await trio.open_file(os.path.join(full_output_dir, 'MD5SUMS'), 'w') as handle:
+            await handle.write(checksums)
 
     parsed_checksums = parse_checksums(checksums)
 
-    download_jobs = []
     for fmt in config.file_format:
         try:
             if has_file_changed(full_output_dir, parsed_checksums, fmt):
-                download_jobs.append(
-                    download_file_job(entry, full_output_dir, parsed_checksums, fmt, symlink_path))
+                yield download_file_job(entry, full_output_dir, parsed_checksums, fmt, symlink_path)
             elif need_to_create_symlink(full_output_dir, parsed_checksums, fmt, symlink_path):
-                download_jobs.append(
-                    create_symlink_job(full_output_dir, parsed_checksums, fmt, symlink_path))
+                yield create_symlink_job(full_output_dir, parsed_checksums, fmt, symlink_path)
         except ValueError as err:
             logger.error(err)
-
-    return download_jobs
 
 
 def create_dir(entry, section, domain, output, flat_output):
@@ -421,11 +400,12 @@ def create_readable_dir(entry, section, domain, output):
     return full_output_dir
 
 
-def grab_checksums_file(entry):
+async def grab_checksums_file(entry):
     """Grab the checksum file for a given entry."""
     http_url = convert_ftp_url(entry['ftp_path'])
     full_url = '{}/md5checksums.txt'.format(http_url)
-    req = requests.get(full_url)
+    # TODO: await here
+    req = await asks.get(full_url)
     return req.text
 
 
@@ -544,13 +524,14 @@ def create_symlink_job(directory, checksums, filetype, symlink_path):
     return DownloadJob(None, local_file, None, full_symlink)
 
 
-def save_and_check(response, local_file, expected_checksum):
+async def save_and_check(response, local_file, expected_checksum):
     """Save the content of an http response and verify the checksum matches."""
-    logger = logging.getLogger("ncbi-genome-download")
-    with open(local_file, 'wb') as handle:
-        for chunk in response.iter_content(4096):
-            handle.write(chunk)
+    async with await trio.open_file(local_file, 'wb') as handle:
+        async with response.body:
+            async for chunk in response.body:
+                await handle.write(chunk)
 
+    # TODO: async here
     actual_checksum = md5sum(local_file)
     if actual_checksum != expected_checksum:
         logger.error('Checksum mismatch for %r. Expected %r, got %r',
