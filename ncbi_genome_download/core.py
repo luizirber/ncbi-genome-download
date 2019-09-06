@@ -1,7 +1,6 @@
 """Core functionality of ncbi-genome-download."""
 from __future__ import print_function
 
-from appdirs import user_cache_dir
 import argparse
 import codecs
 from datetime import datetime, timedelta
@@ -11,8 +10,9 @@ import logging
 import os
 import sys
 from io import StringIO
-from multiprocessing import Pool
+import random
 
+from appdirs import user_cache_dir
 import asks
 import trio
 asks.init('trio')
@@ -183,16 +183,25 @@ async def config_download(config):
 
         return 0
 
-    async with trio.open_nursery() as nursery:
-        for entry, group in download_candidates:
-            async for dl_job in create_downloadjob(entry, group, config):
-                nursery.start_soon(worker, dl_job)
-    # TODO: move exception logic here. save failed dl_job into a list,
-    #       retry it
-    #except requests.exceptions.ConnectionError as err:
-    #    logger.error('Download from NCBI failed: %r', err)
-    # Exit code 75 meas TEMPFAIL in C/C++, so let's stick with that for now.
-    #    return 75
+    # TODO: add option to config for shuffling?
+    random.shuffle(download_candidates)
+
+    failed_tasks = []
+    #try:
+    if 1:
+        async with trio.open_nursery() as nursery:
+            for entry, group in download_candidates:
+                async for dl_job in create_downloadjob(entry, group, config):
+                    nursery.start_soon(worker, dl_job)
+        # TODO: move exception logic here. save failed dl_job into a list,
+        #       retry it
+        #except requests.exceptions.ConnectionError as err:
+        #    logger.error('Download from NCBI failed: %r', err)
+        # Exit code 75 meas TEMPFAIL in C/C++, so let's stick with that for now.
+        #    return 75
+
+    #except asks.errors.RequestTimeout as e:
+    #    failed_tasks.append(e)
 
     if config.metadata_table:
         with codecs.open(config.metadata_table, mode='w', encoding='utf-8') as handle:
