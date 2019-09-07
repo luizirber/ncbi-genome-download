@@ -15,7 +15,6 @@ import random
 from appdirs import user_cache_dir
 import asks
 import trio
-asks.init('trio')
 
 from .config import (
     NgdConfig,
@@ -170,43 +169,41 @@ async def config_download(config):
 
     """
     logger = logging.getLogger("ncbi-genome-download")
-    download_candidates = await select_candidates(config)
+    try:
+        download_candidates = await select_candidates(config)
 
-    if len(download_candidates) < 1:
-        logging.error("No downloads matched your filter. Please check your options.")
-        return 1
+        if len(download_candidates) < 1:
+            logger.error("No downloads matched your filter. Please check your options.")
+            return 1
 
-    if config.dry_run:
-        print("Considering the following {} assemblies for download:".format(len(download_candidates)))
-        for entry, _ in download_candidates:
-            print(entry['assembly_accession'], entry['organism_name'], sep="\t")
+        if config.dry_run:
+            print("Considering the following {} assemblies for download:".format(len(download_candidates)))
+            for entry, _ in download_candidates:
+                print(entry['assembly_accession'], entry['organism_name'], sep="\t")
 
-        return 0
+            return 0
 
-    # TODO: add option to config for shuffling?
-    random.shuffle(download_candidates)
+        # TODO: add option to config for shuffling?
+        random.shuffle(download_candidates)
 
-    failed_tasks = []
-    #try:
-    if 1:
         async with trio.open_nursery() as nursery:
             for entry, group in download_candidates:
                 async for dl_job in create_downloadjob(entry, group, config):
                     nursery.start_soon(worker, dl_job)
-        # TODO: move exception logic here. save failed dl_job into a list,
-        #       retry it
-        #except requests.exceptions.ConnectionError as err:
-        #    logger.error('Download from NCBI failed: %r', err)
+
+        if config.metadata_table:
+            with codecs.open(config.metadata_table, mode='w', encoding='utf-8') as handle:
+                table = metadata.get()
+                table.write(handle)
+
+    except asks.errors.ConnectivityError as err:
+        logger.error('Download from NCBI failed: %r', err)
+        # TODO: save failed dl_job into a list, retry it
+        #except asks.errors.RequestTimeout as e:
+        #    failed_tasks.append(e)
+
         # Exit code 75 meas TEMPFAIL in C/C++, so let's stick with that for now.
-        #    return 75
-
-    #except asks.errors.RequestTimeout as e:
-    #    failed_tasks.append(e)
-
-    if config.metadata_table:
-        with codecs.open(config.metadata_table, mode='w', encoding='utf-8') as handle:
-            table = metadata.get()
-            table.write(handle)
+        return 75
 
     return 0
 
@@ -543,6 +540,7 @@ async def save_and_check(response, local_file, expected_checksum):
     # TODO: async here
     actual_checksum = md5sum(local_file)
     if actual_checksum != expected_checksum:
+        logger = logging.getLogger("ncbi-genome-download")
         logger.error('Checksum mismatch for %r. Expected %r, got %r',
                       local_file, expected_checksum, actual_checksum)
         return False

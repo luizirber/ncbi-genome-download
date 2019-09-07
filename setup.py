@@ -17,9 +17,9 @@ install_requires = [
 
 tests_require = [
     'pytest',
+    'asynctest',
     'coverage',
     'pytest-cov',
-    'requests-mock',
     'pytest-mock',
     'pytest-trio',
 ]
